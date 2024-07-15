@@ -1,0 +1,10 @@
+/target
+
+.idea
+
+server/public/styles/tailwind.css
+
+.direnv
+.devenv
+
+result
