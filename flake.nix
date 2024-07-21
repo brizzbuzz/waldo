@@ -33,7 +33,10 @@
     ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgs = import nixpkgs {
+        inherit system;
+        config.allowUnfree = true;
+      };
 
       inherit (pkgs) lib;
 
@@ -54,10 +57,13 @@
         buildInputs =
           [
             # Add additional build inputs here
+            pkgs.openssl
+            pkgs.pkg-config
           ]
           ++ lib.optionals pkgs.stdenv.isDarwin [
             # Additional darwin specific inputs can be set here
             pkgs.libiconv
+            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
           ];
 
         # Additional environment variables can be set directly
@@ -83,27 +89,6 @@
         // {
           inherit cargoArtifacts;
         });
-
-      docker-image = pkgs.dockerTools.streamLayeredImage {
-        name = "portfolio";
-        tag = "latest"; # TODO: How to version properly?
-        created = "now";
-        contents = [
-          my-crate
-          pkgs.refinery-cli
-          ./public
-          ./templates
-          ./migrations
-        ];
-        config = {
-          Cmd = ["${my-crate}/bin/portfolio"];
-          Env = [
-            "ASSET_PATH=/"
-            "ROCKET_ADDRESS=0.0.0.0"
-            "MIGRATIONS_PATH=${./migrations}"
-          ];
-        };
-      };
     in {
       checks = {
         inherit my-crate;
@@ -141,7 +126,6 @@
 
       packages =
         {
-          inherit docker-image;
           default = my-crate;
         }
         // lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
@@ -159,14 +143,10 @@
         checks = self.checks.${system};
 
         packages = with pkgs; [
+          _1password # 1Password CLI
           cargo-watch # Rust hot-reloading
-          flyctl # Fly.io CLI
           just # Justfile runner
           postgresql_16 # PostgreSQL database
-          process-compose # Process management tool
-          refinery-cli # Database migration tool
-          tailwindcss # Tailwind CSS Utility CLI
-          watchexec # File watcher for non-cargo processes
         ];
       };
     });
