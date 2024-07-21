@@ -1,9 +1,11 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use clap::Parser;
 use postgres_types::{ToSql, Type as PgType};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 use tokio_postgres::{Client, Config, Error as PgError, NoTls, Row};
+use uuid::Uuid;
 
 #[derive(Deserialize, Debug, Clone)]
 struct DatabaseConfig {
@@ -226,18 +228,20 @@ async fn copy_table_data(
 
 fn as_sql_type(row: &Row, idx: usize, ty: &PgType) -> Box<dyn ToSql + Sync> {
     match *ty {
-        PgType::BOOL => Box::new(row.get::<_, bool>(idx)),
-        PgType::INT2 => Box::new(row.get::<_, i16>(idx)),
-        PgType::INT4 => Box::new(row.get::<_, i32>(idx)),
-        PgType::INT8 => Box::new(row.get::<_, i64>(idx)),
-        PgType::FLOAT4 => Box::new(row.get::<_, f32>(idx)),
-        PgType::FLOAT8 => Box::new(row.get::<_, f64>(idx)),
-        PgType::VARCHAR | PgType::TEXT => Box::new(row.get::<_, String>(idx)),
-        // PgType::UUID => Box::new(row.get::<_, Uuid>(idx)),
-        // PgType::TIMESTAMP => Box::new(row.get::<_, NaiveDateTime>(idx)),
-        // PgType::TIMESTAMPTZ => Box::new(row.get::<_, DateTime<Utc>>(idx)),
-        // PgType::DATE => Box::new(row.get::<_, NaiveDate>(idx)),
-        // PgType::BYTEA => Box::new(row.get::<_, Vec<u8>>(idx)),
+        PgType::BOOL => Box::new(row.get::<_, Option<bool>>(idx)),
+        PgType::INT2 => Box::new(row.get::<_, Option<i16>>(idx)),
+        PgType::INT4 => Box::new(row.get::<_, Option<i32>>(idx)),
+        PgType::INT8 => Box::new(row.get::<_, Option<i64>>(idx)),
+        PgType::FLOAT4 => Box::new(row.get::<_, Option<f32>>(idx)),
+        PgType::FLOAT8 => Box::new(row.get::<_, Option<f64>>(idx)),
+        PgType::VARCHAR | PgType::TEXT => Box::new(row.get::<_, Option<String>>(idx)),
+        PgType::UUID => Box::new(row.get::<_, Option<Uuid>>(idx)),
+        PgType::TIMESTAMP => Box::new(row.get::<_, Option<NaiveDateTime>>(idx)),
+        PgType::TIMESTAMPTZ => Box::new(row.get::<_, Option<DateTime<Utc>>>(idx)),
+        PgType::DATE => Box::new(row.get::<_, Option<NaiveDate>>(idx)),
+        PgType::BYTEA => Box::new(row.get::<_, Option<Vec<u8>>>(idx)),
+        PgType::JSON => Box::new(row.get::<_, Option<serde_json::Value>>(idx)),
+        PgType::JSONB => Box::new(row.get::<_, Option<serde_json::Value>>(idx)),
         // Add more types as needed
         _ => panic!("Unsupported type: {:?}", ty),
     }
