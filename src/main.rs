@@ -223,6 +223,20 @@ async fn copy_table_data(
     local_client: &mut Client,
     table_name: &str,
 ) -> Result<(), PgError> {
+    let row_count_query = format!("SELECT COUNT(*) FROM {}", table_name);
+    let row_count: i64 = remote_client.query_one(&row_count_query, &[]).await?.get(0);
+    debug!(
+        "Fetched row count for table '{}': {}",
+        table_name, row_count
+    );
+
+    if row_count == 0 {
+        info!("No data to copy for table '{}'", table_name);
+        return Ok(());
+    }
+
+    // TODO: Pagination
+
     let select_query = format!("SELECT * FROM {}", table_name);
     let rows = remote_client.query(&select_query, &[]).await?;
 
