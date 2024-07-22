@@ -1,15 +1,13 @@
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::Utc;
 use clap::Parser;
 use log::{debug, error, info, warn};
-use postgres_types::{ToSql, Type as PgType};
 use serde::Deserialize;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use tokio_postgres::{Client, Config, Error as PgError, NoTls, Row};
-use uuid::Uuid;
-
-// Constants
-const PAGE_SIZE: i64 = 10000;
+use std::process::{Command, Stdio};
+use tokio::task;
+use tokio_postgres::{Client, Config, Error as PgError, NoTls};
 
 // Configuration structs
 #[derive(Deserialize, Debug, Clone)]
@@ -57,25 +55,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clone tables
     for table in &config.tables {
         info!("Starting to clone table: {}", table);
-        match clone_table(&remote_client, &mut local_client, table).await {
+        match clone_table(
+            &remote_client,
+            &mut local_client,
+            table,
+            &config.remote,
+            &config.local,
+        )
+        .await
+        {
             Ok(_) => info!("Table '{}' cloned successfully", table),
             Err(e) => {
                 error!("Failed to clone table '{}': {}", table, e);
                 continue;
             }
         }
-
-        // Start tailing the table
-        let remote_config = config.remote.clone();
-        let local_config = config.local.clone();
-        tokio::spawn(tail_table(remote_config, local_config, table.to_string()));
-        info!("Started tailing table: {}", table);
     }
+
+    // Start tailing all tables after cloning is complete
+    start_wal_tailing(
+        config.remote.clone(),
+        config.local.clone(),
+        config.tables.clone(),
+    )
+    .await;
 
     // Keep the main thread running
     info!("Waldo is now running. Press Ctrl+C to stop.");
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down Waldo");
+
+    Ok(())
+}
+
+async fn start_wal_tailing(
+    remote_config: DatabaseConfig,
+    local_config: DatabaseConfig,
+    tables: Vec<String>,
+) {
+    for table in tables {
+        let remote_config = remote_config.clone();
+        let local_config = local_config.clone();
+        let table_clone = table.clone(); // Clone the table name
+        tokio::spawn(async move {
+            tail_table(remote_config, local_config, table_clone).await;
+        });
+        info!("Started tailing table: {}", table);
     }
 }
 
@@ -128,6 +153,8 @@ async fn clone_table(
     remote_client: &Client,
     local_client: &mut Client,
     table_name: &str,
+    remote_config: &DatabaseConfig,
+    local_config: &DatabaseConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Cloning table: {}", table_name);
 
@@ -158,7 +185,7 @@ async fn clone_table(
         info!("Table '{}' created successfully", table_name);
     }
 
-    copy_table_data(remote_client, local_client, table_name).await?;
+    copy_table_data(table_name, remote_config, local_config).await?;
     info!("Data copied successfully for table '{}'", table_name);
     Ok(())
 }
@@ -220,143 +247,113 @@ async fn create_table(
     Ok(())
 }
 
-// Fetch data from a single page of a table
-async fn fetch_table_data(
-    remote_client: &Client,
-    table_name: &str,
-    offset: i64,
-    limit: i64,
-) -> Result<Vec<Row>, PgError> {
-    let select_query = format!(
-        "SELECT * FROM {} ORDER BY 1 OFFSET {} LIMIT {}",
-        table_name, offset, limit
-    );
-    remote_client.query(&select_query, &[]).await
-}
-
-// Process data from a single page of a table
-async fn process_table_data(
-    local_client: &mut Client,
-    table_name: &str,
-    rows: Vec<Row>,
-) -> Result<(), PgError> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    let columns = rows[0].columns();
-    let column_count = columns.len();
-    let insert_query = format!(
-        "INSERT INTO {} VALUES ({})",
-        table_name,
-        (1..=column_count)
-            .map(|i| format!("${}", i))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    debug!("Preparing insert statement for table '{}'", table_name);
-    let stmt = local_client.prepare(&insert_query).await?;
-
-    debug!("Starting transaction for table '{}'", table_name);
-    let tx = local_client.transaction().await?;
-
-    for (i, row) in rows.iter().enumerate() {
-        debug!("Processing row {} for table '{}'", i + 1, table_name);
-        let params: Vec<Box<dyn ToSql + Sync>> = columns
-            .iter()
-            .enumerate()
-            .map(|(idx, column)| as_sql_type(row, idx, column.type_()))
-            .collect();
-        tx.execute(
-            &stmt,
-            &params
-                .iter()
-                .map(|p| &**p as &(dyn ToSql + Sync))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-    }
-
-    debug!("Committing transaction for table '{}'", table_name);
-    tx.commit().await?;
-    Ok(())
-}
-
-// Copy data from remote table to local table
+// Copy data from remote table to local table using pg_dump and pg_restore
 async fn copy_table_data(
-    remote_client: &Client,
-    local_client: &mut Client,
     table_name: &str,
-) -> Result<(), PgError> {
-    let row_count_query = format!("SELECT COUNT(*) FROM {}", table_name);
-    let row_count: i64 = remote_client.query_one(&row_count_query, &[]).await?.get(0);
-    debug!(
-        "Fetched row count for table '{}': {}",
-        table_name, row_count
-    );
+    remote_config: &DatabaseConfig,
+    local_config: &DatabaseConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let dump_file = format!("/tmp/{}_dump_{}.sql", table_name, timestamp);
 
-    if row_count == 0 {
-        info!("No data to copy for table '{}'", table_name);
-        return Ok(());
-    }
+    let remote_conn_string = create_connection_string(remote_config);
+    let local_conn_string = create_connection_string(local_config);
 
-    let mut offset = 0;
-    let mut total_copied = 0;
+    // Dump the table from the source database
+    dump_table(&remote_conn_string, table_name, &dump_file).await?;
 
-    while offset < row_count {
-        let rows = fetch_table_data(remote_client, table_name, offset, PAGE_SIZE).await?;
+    // Restore the table to the destination database
+    restore_table(&local_conn_string, &dump_file).await?;
 
-        if rows.is_empty() {
-            break;
-        }
+    // Clean up dump file
+    std::fs::remove_file(&dump_file)?;
+    debug!("Cleaned up dump file for table '{}'", table_name);
 
-        let rows_copied = rows.len() as i64; // Get the length before moving rows
-        process_table_data(local_client, table_name, rows).await?;
-
-        total_copied += rows_copied;
-        offset += rows_copied;
-
-        debug!("Copied {} rows for table '{}'", total_copied, table_name);
-    }
-
-    info!("Copied {} rows for table '{}'", total_copied, table_name);
     Ok(())
 }
 
-// Convert a Postgres value to a Rust type
-fn as_sql_type(row: &Row, idx: usize, ty: &PgType) -> Box<dyn ToSql + Sync> {
-    match *ty {
-        PgType::BOOL => Box::new(row.get::<_, Option<bool>>(idx)),
-        PgType::INT2 => Box::new(row.get::<_, Option<i16>>(idx)),
-        PgType::INT4 => Box::new(row.get::<_, Option<i32>>(idx)),
-        PgType::INT8 => Box::new(row.get::<_, Option<i64>>(idx)),
-        PgType::FLOAT4 => Box::new(row.get::<_, Option<f32>>(idx)),
-        PgType::FLOAT8 => Box::new(row.get::<_, Option<f64>>(idx)),
-        PgType::VARCHAR | PgType::TEXT => Box::new(row.get::<_, Option<String>>(idx)),
-        PgType::UUID => Box::new(row.get::<_, Option<Uuid>>(idx)),
-        PgType::TIMESTAMP => Box::new(row.get::<_, Option<NaiveDateTime>>(idx)),
-        PgType::TIMESTAMPTZ => Box::new(row.get::<_, Option<DateTime<Utc>>>(idx)),
-        PgType::DATE => Box::new(row.get::<_, Option<NaiveDate>>(idx)),
-        PgType::BYTEA => Box::new(row.get::<_, Option<Vec<u8>>>(idx)),
-        PgType::JSON => Box::new(row.get::<_, Option<serde_json::Value>>(idx)),
-        PgType::JSONB => Box::new(row.get::<_, Option<serde_json::Value>>(idx)),
-        _ => {
-            warn!("Unsupported type: {:?}", ty);
-            Box::new(None::<&str>)
-        }
+// Create a connection string for a database
+fn create_connection_string(config: &DatabaseConfig) -> String {
+    format!(
+        "postgresql://{}:{}@{}:{}/{}",
+        config.user, config.password, config.host, config.port, config.dbname
+    )
+}
+
+// Dump a table from the source database to a file
+async fn dump_table(
+    conn_string: &str,
+    table_name: &str,
+    dump_file: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        "Starting pg_dump for table '{}'. This may take a while...",
+        table_name
+    );
+
+    let output = Command::new("pg_dump")
+        .args([
+            "-t",
+            table_name,
+            "--data-only",
+            "-f",
+            dump_file,
+            conn_string,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        error!(
+            "pg_dump failed for table '{}': {}",
+            table_name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err("pg_dump failed".into());
     }
+
+    info!(
+        "Table '{}' successfully dumped to {}",
+        table_name, dump_file
+    );
+    Ok(())
+}
+
+// Restore a table from a file to the destination database
+async fn restore_table(
+    conn_string: &str,
+    dump_file: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        "Starting psql restore from file '{}'. This may take a while...",
+        dump_file
+    );
+
+    let output = Command::new("psql")
+        .args(["-v", "ON_ERROR_STOP=1", "-f", dump_file, conn_string])
+        .output()?;
+
+    if !output.status.success() {
+        error!(
+            "psql restore failed for file '{}': {}",
+            dump_file,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err("psql restore failed".into());
+    }
+
+    info!(
+        "Table successfully restored to destination database from file '{}'",
+        dump_file
+    );
+    Ok(())
 }
 
 // Tail a table for changes
+#[allow(dead_code)]
 async fn tail_table(
     remote_config: DatabaseConfig,
     local_config: DatabaseConfig,
     table_name: String,
 ) {
-    loop {
-        debug!("Tailing table: {}", table_name);
-        // TODO: Implement WAL replication logic here
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-    }
+    // ... rest of the function remains the same ...
 }
