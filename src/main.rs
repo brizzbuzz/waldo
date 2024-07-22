@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use tokio_postgres::{Client, Config, Error as PgError, NoTls, Row};
 use uuid::Uuid;
 
+// Constants
+const PAGE_SIZE: i64 = 10000;
+
 // Configuration structs
 #[derive(Deserialize, Debug, Clone)]
 struct DatabaseConfig {
@@ -217,31 +220,27 @@ async fn create_table(
     Ok(())
 }
 
-// Copy data from remote table to local table
-async fn copy_table_data(
+// Fetch data from a single page of a table
+async fn fetch_table_data(
     remote_client: &Client,
+    table_name: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<Row>, PgError> {
+    let select_query = format!(
+        "SELECT * FROM {} ORDER BY 1 OFFSET {} LIMIT {}",
+        table_name, offset, limit
+    );
+    remote_client.query(&select_query, &[]).await
+}
+
+// Process data from a single page of a table
+async fn process_table_data(
     local_client: &mut Client,
     table_name: &str,
+    rows: Vec<Row>,
 ) -> Result<(), PgError> {
-    let row_count_query = format!("SELECT COUNT(*) FROM {}", table_name);
-    let row_count: i64 = remote_client.query_one(&row_count_query, &[]).await?.get(0);
-    debug!(
-        "Fetched row count for table '{}': {}",
-        table_name, row_count
-    );
-
-    if row_count == 0 {
-        info!("No data to copy for table '{}'", table_name);
-        return Ok(());
-    }
-
-    // TODO: Pagination
-
-    let select_query = format!("SELECT * FROM {}", table_name);
-    let rows = remote_client.query(&select_query, &[]).await?;
-
     if rows.is_empty() {
-        info!("No data to copy for table: {}", table_name);
         return Ok(());
     }
 
@@ -277,15 +276,51 @@ async fn copy_table_data(
                 .collect::<Vec<_>>(),
         )
         .await?;
-        if (i + 1) % 1000 == 0 {
-            debug!("Copied {} rows for table '{}'", i + 1, table_name);
-        }
     }
 
     debug!("Committing transaction for table '{}'", table_name);
     tx.commit().await?;
+    Ok(())
+}
 
-    info!("Copied {} rows for table '{}'", rows.len(), table_name);
+// Copy data from remote table to local table
+async fn copy_table_data(
+    remote_client: &Client,
+    local_client: &mut Client,
+    table_name: &str,
+) -> Result<(), PgError> {
+    let row_count_query = format!("SELECT COUNT(*) FROM {}", table_name);
+    let row_count: i64 = remote_client.query_one(&row_count_query, &[]).await?.get(0);
+    debug!(
+        "Fetched row count for table '{}': {}",
+        table_name, row_count
+    );
+
+    if row_count == 0 {
+        info!("No data to copy for table '{}'", table_name);
+        return Ok(());
+    }
+
+    let mut offset = 0;
+    let mut total_copied = 0;
+
+    while offset < row_count {
+        let rows = fetch_table_data(remote_client, table_name, offset, PAGE_SIZE).await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let rows_copied = rows.len() as i64; // Get the length before moving rows
+        process_table_data(local_client, table_name, rows).await?;
+
+        total_copied += rows_copied;
+        offset += rows_copied;
+
+        debug!("Copied {} rows for table '{}'", total_copied, table_name);
+    }
+
+    info!("Copied {} rows for table '{}'", total_copied, table_name);
     Ok(())
 }
 
@@ -313,7 +348,7 @@ fn as_sql_type(row: &Row, idx: usize, ty: &PgType) -> Box<dyn ToSql + Sync> {
     }
 }
 
-// Tail a table for changes (placeholder function)
+// Tail a table for changes
 async fn tail_table(
     remote_config: DatabaseConfig,
     local_config: DatabaseConfig,
@@ -321,7 +356,7 @@ async fn tail_table(
 ) {
     loop {
         debug!("Tailing table: {}", table_name);
-        // Implement your WAL replication logic here
+        // TODO: Implement WAL replication logic here
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     }
 }
