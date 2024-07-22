@@ -3,10 +3,8 @@ use clap::Parser;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use tokio::task;
+use std::process::Command;
 use tokio_postgres::{Client, Config, Error as PgError, NoTls};
 
 // Configuration structs
